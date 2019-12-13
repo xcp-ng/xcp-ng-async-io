@@ -86,8 +86,11 @@ set_target_properties(${XCP_LIB} PROPERTIES
   EXPORT_NAME ${XCP_MODULE}
   POSITION_INDEPENDENT_CODE ON
 )
-target_compile_options(${XCP_LIB} PUBLIC
-  $<BUILD_INTERFACE:${CUSTOM_C_FLAGS}>
+target_compile_options(${XCP_LIB}
+  PUBLIC
+    $<BUILD_INTERFACE:${CUSTOM_C_FLAGS}>
+  PRIVATE
+    -D_GNU_SOURCE
 )
 
 target_include_directories(${XCP_LIB}

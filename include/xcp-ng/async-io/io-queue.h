@@ -59,6 +59,7 @@ void xcp_io_queue_uninit (XcpIoQueue *queue);
 void xcp_io_queue_insert (XcpIoQueue *queue, XcpIoReq *req);
 
 int xcp_io_queue_submit (XcpIoQueue *queue);
+int xcp_io_queue_submit_n (XcpIoQueue *queue, unsigned int n);
 int xcp_io_queue_cancel (XcpIoQueue *queue);
 
 // Must be called when a notification is received via event fd.
