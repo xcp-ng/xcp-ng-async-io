@@ -122,11 +122,11 @@ static inline void set_sqe_from_req (const XcpIoReq *req, struct io_uring_sqe *s
 // -----------------------------------------------------------------------------
 
 int xcp_io_queue_init (XcpIoQueue *queue, size_t capacity, bool usePolling) {
-  assert(capacity);
-
   // 1. Init fields.
   memset(queue, 0, sizeof *queue);
-  queue->capacity = capacity;
+  if (!capacity)
+    return -EINVAL;
+
   queue->eventFd = -1;
   queue->usePolling = usePolling;
 
@@ -146,12 +146,15 @@ int xcp_io_queue_init (XcpIoQueue *queue, size_t capacity, bool usePolling) {
   } else if (!usePolling && (err = io_uring_register_eventfd(ring, queue->eventFd)) < 0)
     xcp_io_queue_uninit(queue);
   else
-    return 0;
+    queue->capacity = capacity;
 
   return err;
 }
 
 void xcp_io_queue_uninit (XcpIoQueue *queue) {
+  if (!queue->capacity)
+    return;
+
   if (queue->eventFd != -1) {
     close(queue->eventFd);
     queue->eventFd = -1;
