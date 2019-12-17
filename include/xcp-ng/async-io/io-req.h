@@ -117,10 +117,10 @@ XCP_DECL_UNUSED static inline size_t xcp_io_req_get_size (const XcpIoReq *req) {
     case XcpIoOpcodeReadV:
     case XcpIoOpcodeWriteV: {
       size_t size = 0;
-      const struct iovec *vec = (const struct iovec *)req->iov.iov_base;
-      for (uint32_t i = 0; i < req->iov.iov_len; ++i) {
-        assert(vec[i].iov_len);
-        size += vec[i].iov_len;
+      const struct iovec *iov = (const struct iovec *)req->iov.iov_base;
+      for (size_t i = 0; i < req->iov.iov_len; ++i) {
+        assert(iov[i].iov_len);
+        size += iov[i].iov_len;
       }
       return size;
     }

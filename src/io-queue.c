@@ -15,6 +15,7 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/eventfd.h>
@@ -60,8 +61,8 @@ static inline void process_response (XcpIoReq *req, int res) {
   else // TODO: Reschedule instead.
     err = -EIO;
 
-  if (req->cb)
-    req->cb(req, err, req->userData);
+  if (XCP_LIKELY(req->cb))
+     req->cb(req, err, req->userData);
 }
 
 // Fetch responses in the queue and notify user.
@@ -93,13 +94,34 @@ static inline unsigned int fetch_responses (XcpIoQueue *queue) {
   return count;
 }
 
+// Poll responses if polling is enabled.
+static inline int poll_responses (XcpIoQueue *queue) {
+  int ret = 0;
+  if (queue->usePolling && queue->inflightCount) {
+    struct io_uring *ring = &queue->pImpl.ring;
+    do {
+      // We must call explicitly io_uring_enter in this case to get responses.
+      // We can't use io_uring_submit here.
+      ret = (int)syscall(__NR_io_uring_enter, ring->ring_fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, _NSIG / 8);
+    } while (ret < 0 && errno == EAGAIN);
+  }
+  return ret >= 0 ? 0 : ret;
+}
+
 // Cancel all given requests.
 static inline void cancel_requests (XcpIoReq *reqs, int err) {
   while (reqs) {
     XcpIoReq *nextReq = STAILQ_NEXT(reqs, pImpl.next);
-    reqs->cb(reqs, err, reqs->userData);
+
+    if (XCP_LIKELY(reqs->cb))
+      reqs->cb(reqs, err, reqs->userData);
     reqs = nextReq;
   }
+}
+
+static inline void set_sqe_len (struct io_uring_sqe *sqe, size_t len) {
+  assert(len <= UINT32_MAX);
+  sqe->len = (uint32_t)len;
 }
 
 // Fill a io_uring_sqe instance from a XcpIoReq.
@@ -112,7 +134,7 @@ static inline void set_sqe_from_req (const XcpIoReq *req, struct io_uring_sqe *s
   sqe->fd = req->fd;
   sqe->off = (uint64_t)req->offset;
   sqe->addr = (uint64_t)&req->iov;
-  sqe->len = req->opcode == XcpIoOpcodeRead || req->opcode == XcpIoOpcodeWrite ? 1 : (uint32_t)req->iov.iov_len;
+  set_sqe_len(sqe, req->opcode == XcpIoOpcodeRead || req->opcode == XcpIoOpcodeWrite ? 1 : (uint32_t)req->iov.iov_len);
   sqe->rw_flags = 0;
   sqe->user_data = (uint64_t)req;
   sqe->__pad2[0] = sqe->__pad2[1] = sqe->__pad2[2] = 0;
@@ -126,6 +148,8 @@ int xcp_io_queue_init (XcpIoQueue *queue, size_t capacity, bool usePolling) {
   memset(queue, 0, sizeof *queue);
   if (!capacity)
     return -EINVAL;
+  if (capacity > INT_MAX)
+    capacity = INT_MAX;
 
   queue->eventFd = -1;
   queue->usePolling = usePolling;
@@ -208,12 +232,8 @@ int xcp_io_queue_submit (XcpIoQueue *queue) {
 
     assert(queue->pendingCount >= n);
     queue->pendingCount -= n;
-  } else if (queue->usePolling && queue->inflightCount) {
-    // We must call explicitly io_uring_enter in this case to get responses.
-    do {
-      ret = (int)syscall(__NR_io_uring_enter, ring->ring_fd, 0, 0, IORING_ENTER_GETEVENTS, NULL, _NSIG / 8);
-    } while (ret < 0 && errno == EAGAIN);
-  }
+  } else
+    ret = poll_responses(queue);
 
   return ret ? ret : (int)n;
 }
