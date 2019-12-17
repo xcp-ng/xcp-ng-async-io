@@ -84,4 +84,8 @@ XCP_DECL_UNUSED static inline int xcp_io_queue_get_event_fd (const XcpIoQueue *q
   return queue->eventFd;
 }
 
+XCP_DECL_UNUSED static inline bool xcp_io_queue_polling_enabled (const XcpIoQueue *queue) {
+  return queue->usePolling;
+}
+
 #endif // ifndef _XCP_NG_ASYNC_IO_IO_QUEUE_H_
