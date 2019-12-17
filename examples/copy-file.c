@@ -144,6 +144,10 @@ static int copy (XcpIoQueue *queue, int in, int out, off_t inSize) {
     }
   }
 
+  assert(xcp_io_queue_get_inflight_count(queue) == 0);
+  assert(xcp_io_queue_get_pending_count(queue) == 0);
+  assert(xcp_io_queue_is_empty(queue));
+
   return 0;
 }
 
