@@ -14,6 +14,8 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#define _GNU_SOURCE
+
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -31,6 +33,8 @@
 
 #define QUEUE_CAPACITY 64
 #define QUEUE_BLOCK_SIZE 32 * 1024
+
+#define REQ_ALIGNMENT 512
 
 // -----------------------------------------------------------------------------
 
@@ -54,6 +58,7 @@ static inline int get_file_size (int fd, off_t *size) {
 typedef struct {
   XcpIoQueue *queue;
   int out;
+  int flags;
 } WriteContext;
 
 static void write_completion_cb (XcpIoReq *req, int err, void *userArg) {
@@ -75,20 +80,28 @@ static void read_completion_cb (XcpIoReq *req, int err, void *userArg) {
   const size_t blockSize = xcp_io_req_get_size(req);
   const off_t offset = xcp_io_req_get_offset(req);
 
-  xcp_io_req_prep_rw(req, XcpIoOpcodeWrite, writeContext->out, (char *)req + sizeof *req, blockSize, offset);
+  void *buf = (char *)req + (writeContext->flags & O_DIRECT ? REQ_ALIGNMENT : sizeof *req);
+  xcp_io_req_prep_rw(req, XcpIoOpcodeWrite, writeContext->out, buf, blockSize, offset);
   xcp_io_req_set_cb(req, write_completion_cb);
   xcp_io_req_set_user_data(req, NULL);
   xcp_io_queue_insert(writeContext->queue, req);
 }
 
-static int queue_read (XcpIoQueue *queue, int in, size_t blockSize, off_t offset, WriteContext *context) {
-  XcpIoReq *req = malloc(sizeof *req + blockSize);
-  if (!req)
+static int queue_read (XcpIoQueue *queue, int in, size_t blockSize, off_t offset, WriteContext *writeContext) {
+  XcpIoReq *req = NULL;
+
+  if (writeContext->flags & O_DIRECT) {
+    static_assert(sizeof(XcpIoReq) <= REQ_ALIGNMENT, "");
+    const int ret = posix_memalign((void **)&req, REQ_ALIGNMENT, REQ_ALIGNMENT + blockSize);
+    if (ret < 0)
+      return ret;
+  } else if (!(req = malloc(sizeof *req + blockSize)))
     return -ENOMEM;
 
-  xcp_io_req_prep_rw(req, XcpIoOpcodeRead, in, (char *)req + sizeof *req, blockSize, offset);
+  void *buf = (char *)req + (writeContext->flags & O_DIRECT ? REQ_ALIGNMENT : sizeof *req);
+  xcp_io_req_prep_rw(req, XcpIoOpcodeRead, in, buf, blockSize, offset);
   xcp_io_req_set_cb(req, read_completion_cb);
-  xcp_io_req_set_user_data(req, context);
+  xcp_io_req_set_user_data(req, writeContext);
   xcp_io_queue_insert(queue, req);
   return 0;
 }
@@ -104,10 +117,10 @@ static inline int queue_submit (XcpIoQueue *queue) {
 
 // -----------------------------------------------------------------------------
 
-static int copy (XcpIoQueue *queue, int in, int out, off_t inSize) {
+static int copy (XcpIoQueue *queue, int in, int out, off_t inSize, int flags) {
   off_t offset = 0;
 
-  WriteContext writeContext = { queue, out };
+  WriteContext writeContext = { queue, out, flags };
   while (inSize || !xcp_io_queue_is_empty(queue)) {
     // 1. Read from in.
     while (inSize && !xcp_io_queue_is_full(queue)) {
@@ -171,6 +184,7 @@ int main(int argc, char *argv[]) {
     { "in", 1, NULL, 'i' },
     { "out", 1, NULL, 'o' },
     { "polling", 0, NULL, 'p' },
+    { "o-direct", 0, NULL, 'd' },
     { "help", 0, NULL, 'h' },
     { NULL, 0, 0, 0 }
   };
@@ -179,6 +193,7 @@ int main(int argc, char *argv[]) {
   char *outPath = NULL;
 
   bool usePolling = false;
+  int flags = 0;
 
   int option;
   int longindex = 0;
@@ -192,6 +207,9 @@ int main(int argc, char *argv[]) {
         break;
       case 'p':
         usePolling = true;
+        break;
+      case 'd':
+        flags |= O_DIRECT;
         break;
       case 'h':
         usage(argv[0]);
@@ -211,13 +229,13 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  const int in = open(inPath, O_RDONLY);
+  const int in = open(inPath, flags | O_RDONLY);
   if (in < 0) {
     perror("Failed to open input file");
     return EXIT_FAILURE;
   }
 
-  const int out = open(outPath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  const int out = open(outPath, flags | O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (out < 0) {
     perror("Failed to open output file");
     return EXIT_FAILURE;
@@ -237,7 +255,7 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  ret = copy(&queue, in, out, inSize);
+  ret = copy(&queue, in, out, inSize, flags);
   xcp_io_queue_uninit(&queue);
 
   close(in);
