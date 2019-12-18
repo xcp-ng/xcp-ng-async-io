@@ -18,9 +18,10 @@
 #define _XCP_NG_ASYNC_IO_IO_REQ_H_
 
 #include <assert.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <sys/queue.h>
-#include <sys/types.h>
 #include <sys/uio.h>
 
 #include "xcp-ng/async-io/io-global.h"
@@ -49,6 +50,19 @@ typedef struct XcpIoReq XcpIoReq;
 
 typedef void (*XcpIoReqCb)(XcpIoReq *req, int err, void *userArg);
 
+typedef struct XcpIoReqState {
+  struct iovec *remainingIov;
+  size_t remainingCount;
+  size_t written;
+} XcpIoReqState;
+
+static inline void xcp_io_req_state_clear (XcpIoReqState *state) {
+  free(state->remainingIov);
+  state->remainingIov = NULL;
+  state->remainingCount = 0;
+  state->written = 0;
+}
+
 typedef struct XcpIoReq {
   XcpIoReqCb cb;  // Completion callback.
   void *userData; // User data passed to the completion callback.
@@ -62,6 +76,8 @@ typedef struct XcpIoReq {
   off_t offset;
 
   struct {
+    // Field used only if the submit is not complete.
+    XcpIoReqState state;
     STAILQ_ENTRY(XcpIoReq) next; // Next request to schedule.
   } pImpl; // Private implementation, do not touch!
 } XcpIoReq;
@@ -74,6 +90,7 @@ XCP_DECL_UNUSED static inline void xcp_io_req_prep_rw (
   req->iov.iov_base = addr;
   req->iov.iov_len = len;
   req->offset = offset;
+  xcp_io_req_state_clear(&req->pImpl.state);
 }
 
 XCP_DECL_UNUSED static inline void xcp_io_req_set_cb (XcpIoReq *req, XcpIoReqCb cb) {

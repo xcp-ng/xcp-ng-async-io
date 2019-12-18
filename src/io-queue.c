@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
@@ -51,22 +52,83 @@
 
 // -----------------------------------------------------------------------------
 
-// Call the request callback after completion.
-static inline void process_response (XcpIoReq *req, int res) {
-  int err;
-  if (XCP_UNLIKELY(res < 0))
-    err = res;
-  else if (XCP_LIKELY((size_t)res == xcp_io_req_get_size(req)))
-    err = 0;
-  else // TODO: Reschedule instead.
-    err = -EIO;
+static inline void get_iovs_from_req (XcpIoReq *req, size_t *iovCount, struct iovec **src) {
+  const XcpIoReqState *state = &req->pImpl.state;
+  if (state->remainingIov) {
+    *iovCount = state->remainingCount;
+    *src = state->remainingIov;
+  } else if (req->opcode == XcpIoOpcodeRead || req->opcode == XcpIoOpcodeWrite) {
+    *iovCount = 1;
+    *src = &req->iov;
+  } else {
+    *iovCount = req->iov.iov_len;
+    *src = req->iov.iov_base;
+  }
+}
 
+static inline int update_remaining (XcpIoReq *req, size_t written, size_t total) {
+  XcpIoReqState *state = &req->pImpl.state;
+  state->written += written;
+  if (state->written >= total)
+    return -EINVAL;
+
+  size_t iovCount;
+  struct iovec *src;
+  get_iovs_from_req(req, &iovCount, &src);
+
+  size_t n = 0;
+  while (n < iovCount && written >= src[n].iov_len)
+    written -= src[n++].iov_len;
+  if (n >= iovCount)
+    return -EINVAL;
+
+  const size_t remainingCount = iovCount - n;
+  assert(remainingCount);
+
+  const size_t moveSize = sizeof *src * (remainingCount - 1);
+  if (state->remainingIov) {
+    // TODO: Maybe avoid and use an offset instead.
+    memmove(state->remainingIov + 1, src + n + 1, moveSize);
+  } else {
+    if (!(state->remainingIov = malloc(sizeof *state->remainingIov * remainingCount)))
+      return -ENOMEM;
+    memcpy(state->remainingIov + 1, src + n + 1, moveSize);
+  }
+
+  state->remainingIov[0].iov_base = (char *)src[n].iov_base + written;
+  state->remainingIov[0].iov_len = src[n].iov_len - written;
+
+  state->remainingCount = remainingCount;
+
+  return 0;
+}
+
+// Call the request callback after completion.
+static inline int process_response (XcpIoReq *req, int res) {
+  XcpIoReqState *state = &req->pImpl.state;
+
+  int err;
+  if (XCP_LIKELY(res >= 0)) {
+    const size_t written = state->written + (size_t)res;
+    const size_t total = xcp_io_req_get_size(req);
+    assert(written <= total);
+
+    if (XCP_LIKELY(written == total))
+      err = 0;
+    else if (!(err = update_remaining(req, (size_t)res, total)))
+      return 1; // Do not notify. ;)
+  } else
+    err = res;
+
+  xcp_io_req_state_clear(state);
   if (XCP_LIKELY(req->cb))
-     req->cb(req, err, req->userData);
+    req->cb(req, err, req->userData);
+
+  return 0;
 }
 
 // Fetch responses in the queue and notify user.
-static inline unsigned int fetch_responses (XcpIoQueue *queue) {
+static inline unsigned int process_responses (XcpIoQueue *queue) {
   struct io_uring *ring = &queue->pImpl.ring;
 
   // How many responses are ready?
@@ -79,9 +141,17 @@ static inline unsigned int fetch_responses (XcpIoQueue *queue) {
   unsigned int head = *ring->cq.khead;
   const unsigned int mask = *ring->cq.kring_mask;
 
+  unsigned int resubmitCount = 0;
+  STAILQ_HEAD(, XcpIoReq) toResubmit;
+  STAILQ_INIT(&toResubmit);
+
   for (const unsigned int last = head + count; head != last; ++head) {
     const struct io_uring_cqe *cqe = &ring->cq.cqes[head & mask];
-    process_response((XcpIoReq *)cqe->user_data, cqe->res);
+    XcpIoReq *req = (XcpIoReq *)cqe->user_data;
+    if (process_response(req, cqe->res)) {
+      STAILQ_INSERT_TAIL(&toResubmit, req, pImpl.next);
+      ++resubmitCount;
+    }
   }
 
   // Mark responses as read in the ring.
@@ -90,6 +160,14 @@ static inline unsigned int fetch_responses (XcpIoQueue *queue) {
 
   assert(queue->inflightCount >= count);
   queue->inflightCount -= count;
+
+  // Resubmit incomplete requests if necessary.
+  if (resubmitCount) {
+    // TODO: Maybe add own API in xcp-ng-generic and avoid memcpy.
+    STAILQ_CONCAT(&toResubmit, &queue->reqs);
+    memcpy(&queue->reqs, &toResubmit, sizeof queue->reqs);
+    xcp_io_queue_submit_n(queue, resubmitCount);
+  }
 
   return count;
 }
@@ -113,6 +191,7 @@ static inline void cancel_requests (XcpIoReq *reqs, int err) {
   while (reqs) {
     XcpIoReq *nextReq = STAILQ_NEXT(reqs, pImpl.next);
 
+    xcp_io_req_state_clear(&reqs->pImpl.state);
     if (XCP_LIKELY(reqs->cb))
       reqs->cb(reqs, err, reqs->userData);
     reqs = nextReq;
@@ -126,15 +205,23 @@ static inline void set_sqe_len (struct io_uring_sqe *sqe, size_t len) {
 
 // Fill a io_uring_sqe instance from a XcpIoReq.
 static inline void set_sqe_from_req (const XcpIoReq *req, struct io_uring_sqe *sqe) {
+  const XcpIoReqState *state = &req->pImpl.state;
+
   sqe->opcode = req->opcode == XcpIoOpcodeRead || req->opcode == XcpIoOpcodeReadV
     ? IORING_OP_READV
     : IORING_OP_WRITEV;
   sqe->flags = 0;
   sqe->ioprio = 0;
   sqe->fd = req->fd;
-  sqe->off = (uint64_t)req->offset;
-  sqe->addr = (uint64_t)&req->iov;
-  set_sqe_len(sqe, req->opcode == XcpIoOpcodeRead || req->opcode == XcpIoOpcodeWrite ? 1 : (uint32_t)req->iov.iov_len);
+  sqe->off = (uint64_t)req->offset + state->written;
+
+  size_t iovCount;
+  struct iovec *iovs;
+  get_iovs_from_req((XcpIoReq *)req, &iovCount, &iovs);
+
+  sqe->addr = (uint64_t)iovs;
+  set_sqe_len(sqe, iovCount);
+
   sqe->rw_flags = 0;
   sqe->user_data = (uint64_t)req;
   sqe->__pad2[0] = sqe->__pad2[1] = sqe->__pad2[2] = 0;
@@ -192,10 +279,17 @@ void xcp_io_queue_insert (XcpIoQueue *queue, XcpIoReq *req) {
 }
 
 int xcp_io_queue_submit (XcpIoQueue *queue) {
+  return xcp_io_queue_submit_n(queue, INT_MAX);
+}
+
+int xcp_io_queue_submit_n (XcpIoQueue *queue, unsigned int n) {
+  if (!n)
+    return poll_responses(queue);
+
   struct io_uring *ring = &queue->pImpl.ring;
 
   // 1. Insert requests in the ring.
-  size_t n = 0;
+  size_t count = 0;
   XcpIoReq *req = STAILQ_FIRST(&queue->reqs);
   if (XCP_LIKELY(req)) {
     assert(queue->pendingCount);
@@ -204,7 +298,7 @@ int xcp_io_queue_submit (XcpIoQueue *queue) {
     if (XCP_LIKELY(sqe)) {
       set_sqe_from_req(req, sqe);
 
-      for (++n; n < queue->pendingCount; ++n) {
+      for (++count; count < queue->pendingCount && count < n; ++count) {
         struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
         if (!sqe)
           break;
@@ -216,7 +310,7 @@ int xcp_io_queue_submit (XcpIoQueue *queue) {
 
   // 2. Submit requests and clean pending req list.
   int ret = 0;
-  if (XCP_LIKELY(n)) {
+  if (XCP_LIKELY(count)) {
     STAILQ_HEAD(, XcpIoReq) reqsToSubmit;
     STAILQ_INIT(&reqsToSubmit);
     STAILQ_CUT(&queue->reqs, req, &reqsToSubmit, pImpl.next);
@@ -228,14 +322,14 @@ int xcp_io_queue_submit (XcpIoQueue *queue) {
     if (XCP_UNLIKELY(ret < 0))
       cancel_requests(STAILQ_FIRST(&reqsToSubmit), -errno);
     else
-      queue->inflightCount += n;
+      queue->inflightCount += count;
 
-    assert(queue->pendingCount >= n);
-    queue->pendingCount -= n;
+    assert(queue->pendingCount >= count);
+    queue->pendingCount -= count;
   } else
     ret = poll_responses(queue);
 
-  return ret ? ret : (int)n;
+  return ret ? ret : (int)count;
 }
 
 int xcp_io_queue_cancel (XcpIoQueue *queue) {
@@ -250,7 +344,7 @@ int xcp_io_queue_cancel (XcpIoQueue *queue) {
 int xcp_io_queue_process_responses (XcpIoQueue *queue) {
   // Fetch responses directly if polling is used.
   if (queue->usePolling)
-    return (int)fetch_responses(queue);
+    return (int)process_responses(queue);
 
   // Get current response count.
   uint64_t responseCount;
@@ -259,7 +353,7 @@ int xcp_io_queue_process_responses (XcpIoQueue *queue) {
   if (XCP_UNLIKELY(responseCount == 0))
     return 0;
 
-  // Note: The number of responses given by fetch_responses can be greater or lower than response count because
-  // the ring counter can be updated by the kernel just after our previous read.
-  return (int)fetch_responses(queue);
+  // Note: The number of responses given by process_responses can be greater or lower than response count
+  // because the ring counter can be updated by the kernel just after our previous read.
+  return (int)process_responses(queue);
 }
